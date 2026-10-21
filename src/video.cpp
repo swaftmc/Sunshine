@@ -7,7 +7,10 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstdlib>
+#include <fstream>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1827,6 +1830,33 @@ namespace video {
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
    * @return 0 when packets are queued; nonzero when encoding or packetization fails.
    */
+  /**
+   * @brief Append encoded bytes to the server-side recording file when SUNSHINE_RECORD_PATH is set.
+   *
+   * @param data Encoded frame bytes.
+   * @param size Number of bytes to append.
+   */
+  void record_encoded_bytes(const void *data, std::size_t size) {
+    static std::mutex record_mutex;
+    static std::ofstream record_file;
+    static bool initialized = false;
+
+    const char *path = std::getenv("SUNSHINE_RECORD_PATH");
+    if (path == nullptr || path[0] == '\0') {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(record_mutex);
+    if (!initialized) {
+      record_file.open(path, std::ios::binary | std::ios::trunc);
+      initialized = true;
+    }
+    if (record_file.is_open() && data != nullptr && size > 0) {
+      record_file.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
+      record_file.flush();
+    }
+  }
+
   int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
@@ -1893,6 +1923,8 @@ namespace video {
         packet->frame_timestamp = frame_timestamp;
       }
 
+      record_encoded_bytes(av_packet->data, static_cast<std::size_t>(av_packet->size));
+
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       packets->raise(std::move(packet));
@@ -1921,6 +1953,8 @@ namespace video {
     if (frame_nr != encoded_frame.frame_index) {
       BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
     }
+
+    record_encoded_bytes(encoded_frame.data.data(), encoded_frame.data.size());
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
