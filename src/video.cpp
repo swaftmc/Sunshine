@@ -1849,7 +1849,7 @@ namespace video {
     std::lock_guard<std::mutex> lock(record_mutex);
     if (!initialized) {
       record_file.open(path, std::ios::binary | std::ios::trunc);
-      initialized = true;
+      initialized = record_file.is_open();
     }
     if (record_file.is_open() && data != nullptr && size > 0) {
       record_file.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
