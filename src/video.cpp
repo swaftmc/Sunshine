@@ -8,11 +8,13 @@
 #include <atomic>
 #include <bitset>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <list>
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <windows.h>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -1840,16 +1842,26 @@ namespace video {
     static std::mutex record_mutex;
     static std::ofstream record_file;
     static bool initialized = false;
+    static std::string record_path;
 
-    const char *path = std::getenv("SUNSHINE_RECORD_PATH");
-    if (path == nullptr || path[0] == '\0') {
-      return;
+    if (!initialized) {
+      const char *env_path = std::getenv("SUNSHINE_RECORD_PATH");
+      if (env_path != nullptr && env_path[0] != '\0') {
+        record_path = env_path;
+      } else {
+        char exe_path[MAX_PATH] = {0};
+        GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+        std::filesystem::path p {exe_path};
+        p = p.parent_path() / "output" / "server_sent.h264";
+        record_path = p.string();
+      }
+      std::filesystem::create_directories(std::filesystem::path {record_path}.parent_path());
     }
 
     std::lock_guard<std::mutex> lock(record_mutex);
     if (!initialized) {
-      record_file.open(path, std::ios::binary | std::ios::trunc);
-      initialized = record_file.is_open();
+      record_file.open(record_path, std::ios::binary | std::ios::trunc);
+      initialized = true;
     }
     if (record_file.is_open() && data != nullptr && size > 0) {
       record_file.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
