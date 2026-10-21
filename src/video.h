@@ -799,4 +799,9 @@ namespace video {
     const AVRational fps = framerate_to_rational(config);
     return std::chrono::nanoseconds {(static_cast<int64_t>(fps.den) * 1'000'000'000LL) / fps.num};
   }
+
+  /**
+   * @brief Close the active server-side video recording and mux it into an MP4 container.
+   */
+  void finish_recording();
 }  // namespace video

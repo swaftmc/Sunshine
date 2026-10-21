@@ -20,6 +20,7 @@
 #include <boost/pointer_cast.hpp>
 
 extern "C" {
+#include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
@@ -1833,40 +1834,190 @@ namespace video {
    * @return 0 when packets are queued; nonzero when encoding or packetization fails.
    */
   /**
-   * @brief Append encoded bytes to the server-side recording file when SUNSHINE_RECORD_PATH is set.
+   * @brief State of the server-side video recording.
+   */
+  struct recording_state_t {
+    std::mutex mutex;
+    std::ofstream file;
+    std::string path;
+    const void *session = nullptr;
+  };
+
+  /**
+   * @brief Access the shared server-side recording state.
+   *
+   * @return The recording state.
+   */
+  recording_state_t &recording_state() {
+    static recording_state_t state;
+    return state;
+  }
+
+  /**
+   * @brief Mux a raw elementary stream file into an MP4 container.
+   *
+   * @param raw_path Path of the raw recorded bitstream.
+   * @param mp4_path Path of the MP4 file to create.
+   * @return True when the MP4 file was written successfully.
+   */
+  bool mux_recording(const std::string &raw_path, const std::string &mp4_path) {
+    if (raw_path.empty()) {
+      return false;
+    }
+
+    AVFormatContext *input_ctx = nullptr;
+    const AVInputFormat *input_format = av_find_input_format("h264");
+    if (avformat_open_input(&input_ctx, raw_path.c_str(), input_format, nullptr) < 0) {
+      // The stream may be HEVC instead of H.264.
+      input_ctx = nullptr;
+      input_format = av_find_input_format("hevc");
+      if (input_format == nullptr || avformat_open_input(&input_ctx, raw_path.c_str(), input_format, nullptr) < 0) {
+        return false;
+      }
+    }
+
+    if (avformat_find_stream_info(input_ctx, nullptr) < 0 || input_ctx->nb_streams == 0) {
+      avformat_close_input(&input_ctx);
+      return false;
+    }
+
+    AVFormatContext *output_ctx = nullptr;
+    if (avformat_alloc_output_context2(&output_ctx, nullptr, "mp4", mp4_path.c_str()) < 0 || output_ctx == nullptr) {
+      avformat_close_input(&input_ctx);
+      return false;
+    }
+
+    AVStream *output_stream = avformat_new_stream(output_ctx, nullptr);
+    if (output_stream == nullptr || avcodec_parameters_copy(output_stream->codecpar, input_ctx->streams[0]->codecpar) < 0) {
+      avformat_free_context(output_ctx);
+      avformat_close_input(&input_ctx);
+      return false;
+    }
+    output_stream->codecpar->codec_tag = 0;
+    output_stream->time_base = input_ctx->streams[0]->time_base;
+
+    if (avio_open(&output_ctx->pb, mp4_path.c_str(), AVIO_FLAG_WRITE) < 0) {
+      avformat_free_context(output_ctx);
+      avformat_close_input(&input_ctx);
+      return false;
+    }
+
+    if (avformat_write_header(output_ctx, nullptr) < 0) {
+      avio_closep(&output_ctx->pb);
+      avformat_free_context(output_ctx);
+      avformat_close_input(&input_ctx);
+      return false;
+    }
+
+    AVPacket *packet = av_packet_alloc();
+    bool ok = packet != nullptr;
+    // The raw elementary stream demuxers do not assign timestamps, so build them
+    // from the packet durations to keep the muxer from rejecting the packets.
+    int64_t next_pts = 0;
+    while (ok && av_read_frame(input_ctx, packet) >= 0) {
+      if (packet->pts == AV_NOPTS_VALUE) {
+        packet->pts = next_pts;
+        packet->dts = next_pts;
+      }
+      next_pts += packet->duration > 0 ? packet->duration : 0;
+      packet->stream_index = 0;
+      ok = av_interleaved_write_frame(output_ctx, packet) >= 0;
+      av_packet_unref(packet);
+    }
+    if (packet != nullptr) {
+      av_packet_free(&packet);
+    }
+
+    av_write_trailer(output_ctx);
+    avio_closep(&output_ctx->pb);
+    avformat_free_context(output_ctx);
+    avformat_close_input(&input_ctx);
+
+    return ok;
+  }
+
+  /**
+   * @brief Mux the recorded bitstream of a finished session into an MP4 container.
+   *
+   * @param state Recording state holding the raw file path.
+   */
+  void finish_recording_locked(recording_state_t &state);
+
+  /**
+   * @brief Append encoded bytes of an active stream to the server-side recording.
+   *
+   * Frames encoded while probing the available encoders are ignored because they
+   * are not associated with a stream session.
    *
    * @param data Encoded frame bytes.
    * @param size Number of bytes to append.
+   * @param session Stream session the frame belongs to. Null for encoder probing.
    */
-  void record_encoded_bytes(const void *data, std::size_t size) {
-    static std::mutex record_mutex;
-    static std::ofstream record_file;
-    static bool initialized = false;
-    static std::string record_path;
+  void record_encoded_bytes(const void *data, std::size_t size, const void *session) {
+    if (session == nullptr) {
+      return;
+    }
 
-    if (!initialized) {
+    auto &state = recording_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (session != state.session) {
+      // A new stream session started, so the previous recording is complete.
+      if (state.session != nullptr) {
+        state.file.close();
+        finish_recording_locked(state);
+      }
+      state.session = session;
+
       const char *env_path = std::getenv("SUNSHINE_RECORD_PATH");
       if (env_path != nullptr && env_path[0] != '\0') {
-        record_path = env_path;
+        state.path = env_path;
       } else {
         char exe_path[MAX_PATH] = {0};
         GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
         std::filesystem::path p {exe_path};
         p = p.parent_path() / "output" / "server_sent.h264";
-        record_path = p.string();
+        state.path = p.string();
       }
-      std::filesystem::create_directories(std::filesystem::path {record_path}.parent_path());
+      std::filesystem::create_directories(std::filesystem::path {state.path}.parent_path());
+      state.file.open(state.path, std::ios::binary | std::ios::trunc);
     }
+    if (state.file.is_open() && data != nullptr && size > 0) {
+      state.file.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
+      state.file.flush();
+    }
+  }
 
-    std::lock_guard<std::mutex> lock(record_mutex);
-    if (!initialized) {
-      record_file.open(record_path, std::ios::binary | std::ios::trunc);
-      initialized = true;
+  /**
+   * @brief Mux the recorded bitstream of a finished session into an MP4 container.
+   *
+   * @param state Recording state holding the raw file path.
+   */
+  void finish_recording_locked(recording_state_t &state) {
+    std::string mp4_path = state.path;
+    if (mp4_path.size() > 5 && mp4_path.compare(mp4_path.size() - 5, 5, ".h264") == 0) {
+      mp4_path = mp4_path.substr(0, mp4_path.size() - 5);
     }
-    if (record_file.is_open() && data != nullptr && size > 0) {
-      record_file.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
-      record_file.flush();
+    mp4_path += ".mp4";
+
+    if (mux_recording(state.path, mp4_path)) {
+      BOOST_LOG(info) << "Muxed server recording to "sv << mp4_path;
+    } else {
+      BOOST_LOG(warning) << "Failed to mux server recording to "sv << mp4_path;
     }
+  }
+
+  /**
+   * @brief Close the active server-side recording and mux it into an MP4 container.
+   */
+  void finish_recording() {
+    auto &state = recording_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.session == nullptr) {
+      return;
+    }
+    state.file.close();
+    state.session = nullptr;
+    finish_recording_locked(state);
   }
 
   int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
@@ -1935,7 +2086,7 @@ namespace video {
         packet->frame_timestamp = frame_timestamp;
       }
 
-      record_encoded_bytes(av_packet->data, static_cast<std::size_t>(av_packet->size));
+      record_encoded_bytes(av_packet->data, static_cast<std::size_t>(av_packet->size), channel_data);
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
@@ -1966,7 +2117,7 @@ namespace video {
       BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
     }
 
-    record_encoded_bytes(encoded_frame.data.data(), encoded_frame.data.size());
+    record_encoded_bytes(encoded_frame.data.data(), encoded_frame.data.size(), channel_data);
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;

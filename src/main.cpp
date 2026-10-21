@@ -578,6 +578,9 @@ int main(int argc, char *argv[]) {
   task_pool.stop();
   task_pool.join();
 
+  // Finalize the server-side video recording and mux it into an MP4 container.
+  video::finish_recording();
+
 #ifdef _WIN32
   // Restore global NVIDIA control panel settings
   if (nvprefs_instance.owning_undo_file() && nvprefs_instance.load()) {
