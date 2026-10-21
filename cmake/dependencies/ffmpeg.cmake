@@ -125,10 +125,14 @@ if(NOT DEFINED FFMPEG_PREPARED_BINARIES)
     endif()
 
     set(FFMPEG_LIBRARIES
+        "${FFMPEG_PREPARED_BINARIES}/lib/libavformat.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libavcodec.a"
+        "${FFMPEG_PREPARED_BINARIES}/lib/libswresample.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libswscale.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libavutil.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libcbs.a"
+        "${FFMPEG_PREPARED_BINARIES}/lib/libdav1d.a"
+        "${FFMPEG_PREPARED_BINARIES}/lib/libopus.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libSvtAv1Enc.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libx264.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libx265.a"
@@ -152,13 +156,21 @@ else()
 
     # Set base FFmpeg libraries (always required)
     set(FFMPEG_LIBRARIES
+        "${FFMPEG_PREPARED_BINARIES}/lib/libavformat.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libavcodec.a"
+        "${FFMPEG_PREPARED_BINARIES}/lib/libswresample.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libswscale.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libavutil.a"
         "${FFMPEG_PREPARED_BINARIES}/lib/libcbs.a"
     )
 
     # Add optional libraries if they exist (e.g., from prebuilt packages)
+    if(EXISTS "${FFMPEG_PREPARED_BINARIES}/lib/libdav1d.a")
+        list(APPEND FFMPEG_LIBRARIES "${FFMPEG_PREPARED_BINARIES}/lib/libdav1d.a")
+    endif()
+    if(EXISTS "${FFMPEG_PREPARED_BINARIES}/lib/libopus.a")
+        list(APPEND FFMPEG_LIBRARIES "${FFMPEG_PREPARED_BINARIES}/lib/libopus.a")
+    endif()
     if(EXISTS "${FFMPEG_PREPARED_BINARIES}/lib/libSvtAv1Enc.a")
         list(APPEND FFMPEG_LIBRARIES "${FFMPEG_PREPARED_BINARIES}/lib/libSvtAv1Enc.a")
     endif()

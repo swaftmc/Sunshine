@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <codecvt>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -252,6 +253,19 @@ int main(int argc, char *argv[]) {
   // parse config file
   if (config::parse(argc, argv)) {
     return 0;
+  }
+
+  // Allow overriding the log file location via the SUNSHINE_LOG_PATH environment variable.
+  if (const char *env_log_path = std::getenv("SUNSHINE_LOG_PATH"); env_log_path != nullptr && env_log_path[0] != '\0') {
+    const std::filesystem::path env_path {std::u8string {env_log_path, env_log_path + std::strlen(env_log_path)}};
+    const auto parent = env_path.parent_path();
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (!ec) {
+      config::sunshine.log_file = env_path.string();
+    } else {
+      std::cerr << "Failed to create log directory '" << parent.string() << "': " << ec.message() << '\n';
+    }
   }
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
@@ -524,6 +538,9 @@ int main(int argc, char *argv[]) {
 
   task_pool.stop();
   task_pool.join();
+
+  // Finalize the server-side video recording and mux it into an MP4 container.
+  video::finish_recording();
 
 #ifdef _WIN32
   // Restore global NVIDIA control panel settings
