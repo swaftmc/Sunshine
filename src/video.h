@@ -783,4 +783,9 @@ namespace video {
    * @brief Close the active server-side video recording and mux it into an MP4 container.
    */
   void finish_recording();
+
+  /**
+   * @brief Mux a recording left behind by a previous run into an MP4 container.
+   */
+  void mux_pending_recording();
 }  // namespace video

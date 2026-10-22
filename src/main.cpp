@@ -269,6 +269,9 @@ int main(int argc, char *argv[]) {
   }
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
+
+  // Mux a recording left behind by a previous run that was terminated early.
+  video::mux_pending_recording();
   if (!log_deinit_guard) {
     BOOST_LOG(error) << "Logging failed to initialize"sv;
   }
