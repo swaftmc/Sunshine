@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 #include <windows.h>
 
 // lib includes
@@ -1844,6 +1845,55 @@ namespace video {
   }
 
   /**
+   * @brief Detect the codec of a raw Annex-B elementary stream.
+   *
+   * The raw elementary stream demuxers cannot always tell H.264 and HEVC apart,
+   * so the NAL unit types are inspected instead.
+   *
+   * @param raw_path Path of the raw recorded bitstream.
+   * @return The detected codec, or AV_CODEC_ID_NONE when it could not be detected.
+   */
+  AVCodecID detect_codec(const std::string &raw_path) {
+    std::ifstream file(raw_path, std::ios::binary);
+    if (!file.is_open()) {
+      return AV_CODEC_ID_NONE;
+    }
+
+    std::vector<uint8_t> data(4096);
+    file.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    const std::streamsize size = file.gcount();
+
+    for (std::streamsize i = 0; i + 3 < size; ++i) {
+      // Find an Annex-B start code.
+      std::streamsize nal = 0;
+      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+        nal = i + 3;
+      } else if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+        nal = i + 4;
+      } else {
+        continue;
+      }
+      if (nal >= size) {
+        break;
+      }
+
+      const uint8_t header = data[nal];
+      // H.264 NAL types are the low 5 bits, HEVC NAL types are bits 1-6.
+      const uint8_t h264_type = header & 0x1F;
+      const uint8_t hevc_type = (header >> 1) & 0x3F;
+
+      if (h264_type == 7 || h264_type == 8) {
+        return AV_CODEC_ID_H264;
+      }
+      if (hevc_type == 32 || hevc_type == 33 || hevc_type == 34) {
+        return AV_CODEC_ID_HEVC;
+      }
+    }
+
+    return AV_CODEC_ID_NONE;
+  }
+
+  /**
    * @brief Mux a raw elementary stream file into an MP4 container.
    *
    * @param raw_path Path of the raw recorded bitstream.
@@ -1855,17 +1905,28 @@ namespace video {
       return false;
     }
 
-    AVFormatContext *input_ctx = nullptr;
-    const AVInputFormat *input_format = av_find_input_format("h264");
-    if (avformat_open_input(&input_ctx, raw_path.c_str(), input_format, nullptr) < 0) {
-      // The stream may be HEVC instead of H.264.
-      input_ctx = nullptr;
-      input_format = av_find_input_format("hevc");
-      if (input_format == nullptr || avformat_open_input(&input_ctx, raw_path.c_str(), input_format, nullptr) < 0) {
+    const AVCodecID codec = detect_codec(raw_path);
+    const char *demuxer = nullptr;
+    switch (codec) {
+      case AV_CODEC_ID_H264:
+        demuxer = "h264";
+        break;
+      case AV_CODEC_ID_HEVC:
+        demuxer = "hevc";
+        break;
+      default:
         return false;
-      }
     }
 
+    const AVInputFormat *input_format = av_find_input_format(demuxer);
+    if (input_format == nullptr) {
+      return false;
+    }
+
+    AVFormatContext *input_ctx = nullptr;
+    if (avformat_open_input(&input_ctx, raw_path.c_str(), input_format, nullptr) < 0) {
+      return false;
+    }
     if (avformat_find_stream_info(input_ctx, nullptr) < 0 || input_ctx->nb_streams == 0) {
       avformat_close_input(&input_ctx);
       return false;
@@ -1903,13 +1964,19 @@ namespace video {
     bool ok = packet != nullptr;
     // The raw elementary stream demuxers do not assign timestamps, so build them
     // from the packet durations to keep the muxer from rejecting the packets.
+    const int64_t default_duration = av_rescale(1, input_ctx->streams[0]->time_base.den, 30);
     int64_t next_pts = 0;
     while (ok && av_read_frame(input_ctx, packet) >= 0) {
       if (packet->pts == AV_NOPTS_VALUE) {
         packet->pts = next_pts;
-        packet->dts = next_pts;
       }
-      next_pts += packet->duration > 0 ? packet->duration : 0;
+      if (packet->dts == AV_NOPTS_VALUE) {
+        packet->dts = packet->pts;
+      }
+      if (packet->duration <= 0) {
+        packet->duration = default_duration;
+      }
+      next_pts += packet->duration;
       packet->stream_index = 0;
       ok = av_interleaved_write_frame(output_ctx, packet) >= 0;
       av_packet_unref(packet);
@@ -1932,6 +1999,13 @@ namespace video {
    * @param state Recording state holding the raw file path.
    */
   void finish_recording_locked(recording_state_t &state);
+
+  /**
+   * @brief Determine the path of the server-side recording.
+   *
+   * @return Path of the raw recording file.
+   */
+  std::string recording_path();
 
   /**
    * @brief Append encoded bytes of an active stream to the server-side recording.
@@ -1958,16 +2032,7 @@ namespace video {
       }
       state.session = session;
 
-      const char *env_path = std::getenv("SUNSHINE_RECORD_PATH");
-      if (env_path != nullptr && env_path[0] != '\0') {
-        state.path = env_path;
-      } else {
-        char exe_path[MAX_PATH] = {0};
-        GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-        std::filesystem::path p {exe_path};
-        p = p.parent_path() / "output" / "server_sent.h264";
-        state.path = p.string();
-      }
+      state.path = recording_path();
       std::filesystem::create_directories(std::filesystem::path {state.path}.parent_path());
       state.file.open(state.path, std::ios::binary | std::ios::trunc);
     }
@@ -2008,6 +2073,48 @@ namespace video {
     state.file.close();
     state.session = nullptr;
     finish_recording_locked(state);
+  }
+
+  /**
+   * @brief Determine the path of the server-side recording.
+   *
+   * @return Path of the raw recording file.
+   */
+  std::string recording_path() {
+    const char *env_path = std::getenv("SUNSHINE_RECORD_PATH");
+    if (env_path != nullptr && env_path[0] != '\0') {
+      return env_path;
+    }
+    char exe_path[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    return (std::filesystem::path {exe_path}.parent_path() / "output" / "server_sent.h264").string();
+  }
+
+  /**
+   * @brief Mux a recording left behind by a previous run into an MP4 container.
+   *
+   * Sunshine may be terminated before the recording is muxed, so the raw file is
+   * muxed on the next start as well.
+   */
+  void mux_pending_recording() {
+    const std::string raw_path = recording_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(raw_path, ec) || ec) {
+      return;
+    }
+    if (std::filesystem::file_size(raw_path, ec) == 0 || ec) {
+      return;
+    }
+    std::string mp4_path = raw_path;
+    if (mp4_path.size() > 5 && mp4_path.compare(mp4_path.size() - 5, 5, ".h264") == 0) {
+      mp4_path = mp4_path.substr(0, mp4_path.size() - 5);
+    }
+    mp4_path += ".mp4";
+    if (mux_recording(raw_path, mp4_path)) {
+      BOOST_LOG(info) << "Muxed pending server recording to "sv << mp4_path;
+    } else {
+      BOOST_LOG(warning) << "Failed to mux pending server recording "sv << raw_path;
+    }
   }
 
   /**
